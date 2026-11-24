@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
+import type { RedisClientType } from "@keyv/redis";
 import { openStore, preload, threadCount } from "./workload.js";
 
 const servers = [
@@ -9,6 +10,15 @@ const servers = [
 ];
 
 type Sample = { writes: number; end: number };
+
+// used_memory from INFO memory, which Redis, Valkey and KiviDB all report.
+async function usedMemory(client: RedisClientType): Promise<number> {
+	const match = /^used_memory:(\d+)/m.exec(await client.info("memory"));
+	if (!match) {
+		throw new Error("The server did not report used_memory.");
+	}
+	return Number(match[1]);
+}
 
 async function measurePoint(uri: string, namespace: string, connections: number) {
 	const workers: Worker[] = [];
@@ -65,14 +75,16 @@ async function runPoint(name: string, uri: string, connections: number) {
 	try {
 		const store = openStore(uri, namespace);
 		try {
-			await store.getClient();
+			const client = (await store.getClient()) as RedisClientType;
 			try {
 				stage = "preload";
+				const before = await usedMemory(client);
 				await preload(store);
+				const memory = (await usedMemory(client)) - before;
 				stage = "workload or reply verification";
 				const sample = await measurePoint(uri, namespace, connections);
 				stage = "cleanup";
-				return sample;
+				return { ...sample, memory };
 			} finally {
 				await store.clear();
 			}
@@ -87,14 +99,15 @@ async function runPoint(name: string, uri: string, connections: number) {
 
 export async function runBenchmarks(): Promise<string> {
 	const rows = [
-		"| Server | Connections | Verified reads | Verified writes | Operations/s |",
-		"| --- | ---: | ---: | ---: | ---: |",
+		"| Server | Connections | Operations/s | Memory for 200,000 keys | Verified reads | Verified writes |",
+		"| --- | ---: | ---: | ---: | ---: | ---: |",
 	];
 	for (const { name, uri } of servers) {
 		for (const connections of [48, 500]) {
 			console.log(`${name}, ${connections} connections`);
-			const { reads, writes, ops } = await runPoint(name, uri, connections);
-			rows.push(`| ${name} | ${connections} | ${reads} | ${writes} | ${ops} |`);
+			const { reads, writes, ops, memory } = await runPoint(name, uri, connections);
+			const mb = (memory / 1024 / 1024).toFixed(1);
+			rows.push(`| ${name} | ${connections} | ${ops} | ${mb} MB | ${reads} | ${writes} |`);
 		}
 	}
 	return rows.join("\n");
